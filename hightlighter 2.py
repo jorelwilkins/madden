@@ -1,9 +1,23 @@
+#!/usr/bin/env python3
+"""
+Madden Highlight + Shorts Watcher (Cross-Platform: macOS + Windows)
+
+Updates vs your original:
+- ✅ WATCH_FOLDER can come from env var (recommended) and works on Windows paths
+- ✅ Verifies ffmpeg + ffprobe exist (clear error if missing)
+- ✅ Avoids re-processing its own output files (_BEST/_SHORT_XX)
+- ✅ More robust file-stability wait (handles rename/move + Drive sync better)
+- ✅ Cleaner logging + safer exception handling
+"""
+
+import os
 import time
+import json
+import csv
+import shutil
 import subprocess
 from pathlib import Path
-from typing import List, Tuple, Optional
-import csv
-import json
+from typing import List, Tuple
 
 import cv2
 import numpy as np
@@ -14,26 +28,30 @@ from watchdog.events import FileSystemEventHandler
 # SETTINGS (EDIT THESE)
 # ====================
 
-# ✅ CHANGE THIS to your Google Drive local folder 
-# Example:
-# WATCH_FOLDER = "/Users/yourname/Library/CloudStorage/GoogleDrive-your@gmail.com/My Drive/game video"
-WATCH_FOLDER = "/Users/jd/stream-agents/madden26-agent"
+# Recommended: set WATCH_FOLDER via environment variable per machine.
+# Windows PowerShell example:
+#   $env:WATCH_FOLDER = "C:\Videos\madden26-agent"
+#
+# macOS zsh example:
+#   export WATCH_FOLDER="/Users/jd/stream-agents/madden26-agent"
+DEFAULT_WATCH_FOLDER = "/Users/jd/stream-agents/madden26-agent"
+WATCH_FOLDER = os.getenv("WATCH_FOLDER", DEFAULT_WATCH_FOLDER)
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov"}
 
 # Output naming
 HIGHLIGHT_SUFFIX = "_BEST.mp4"
-SHORT_SUFFIX_FMT = "_SHORT_{:02d}.mp4"   # _SHORT_01, _SHORT_02
+SHORT_SUFFIX_FMT = "_SHORT_{:02d}.mp4"  # _SHORT_01, _SHORT_02
 
 # Durations
-HIGHLIGHT_LEN_SEC = 600    # 10 minutes
-SHORT_LEN_SEC = 45         # Shorts
+HIGHLIGHT_LEN_SEC = 600  # 10 minutes
+SHORT_LEN_SEC = 45       # Shorts
 SHORTS_TO_MAKE = 2
 
 # Motion sampling
-SAMPLE_SEC = 0.5           # sample frames every 0.5 sec
-PRE_ROLL_HIGHLIGHT = 10     # seconds before highlight start
-PRE_ROLL_SHORT = 5         # seconds before short start
+SAMPLE_SEC = 0.5
+PRE_ROLL_HIGHLIGHT = 5
+PRE_ROLL_SHORT = 3
 
 # Avoid overlapping shorts
 MIN_GAP_SHORT_SEC = 60
@@ -45,7 +63,7 @@ CHECK_INTERVAL = 2
 # Shorts formatting (vertical)
 MAKE_VERTICAL_SHORTS = True
 
-# YouTube metadata defaults (edit once)
+# YouTube metadata defaults
 GAME_NAME = "Madden NFL 26"
 PLATFORM = "PS5"
 HASHTAGS = ["#madden26", "#mut", "#ps5", "#gaming", "#shorts"]
@@ -56,12 +74,28 @@ PRIVACY_SUGGESTION = "public"
 
 
 # ====================
+# Helpers: PATH checks
+# ====================
+def require_on_path(exe: str) -> str:
+    """Return resolved path to exe, or raise a clear error."""
+    found = shutil.which(exe)
+    if not found:
+        raise RuntimeError(
+            f"'{exe}' not found on PATH.\n\n"
+            "Install FFmpeg (must include ffmpeg + ffprobe) and reopen your terminal.\n"
+            "Windows (winget): winget install --id Gyan.FFmpeg -e\n"
+            "macOS (brew):     brew install ffmpeg\n"
+        )
+    return found
+
+
+# ====================
 # FFmpeg helpers
 # ====================
 def run(cmd: List[str]) -> str:
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if p.returncode != 0:
-        raise RuntimeError(f"Command failed: {' '.join(cmd)}\n{p.stderr}")
+        raise RuntimeError(f"Command failed:\n  {' '.join(cmd)}\n\n{p.stderr.strip()}")
     return p.stdout
 
 def ffprobe_duration(video_path: str) -> float:
@@ -97,22 +131,31 @@ def export_clip_reencode(video_path: str, out_path: str, start_sec: float, durat
 # ====================
 # File stability check
 # ====================
-def wait_until_file_stable(path: Path, stable_seconds=STABLE_SECONDS) -> bool:
+def wait_until_file_stable(path: Path, stable_seconds: int = STABLE_SECONDS) -> bool:
+    """
+    Wait until file size is unchanged for stable_seconds.
+    Handles sync/download behavior more reliably than a single sleep.
+    """
     last_size = -1
     stable_for = 0
+
     while stable_for < stable_seconds:
-        try:
-            size = path.stat().st_size
-        except FileNotFoundError:
+        if not path.exists():
             return False
 
-        if size == last_size and size > 0:
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = -1
+
+        if size > 0 and size == last_size:
             stable_for += CHECK_INTERVAL
         else:
             stable_for = 0
             last_size = size
 
         time.sleep(CHECK_INTERVAL)
+
     return True
 
 
@@ -156,7 +199,6 @@ def compute_motion_series(video_path: str, sample_sec: float) -> Tuple[np.ndarra
 
     return np.array(times, dtype=np.float32), np.array(motions, dtype=np.float32), float(duration)
 
-
 def best_motion_window_start(times: np.ndarray, motions: np.ndarray, duration: float, window_sec: int) -> float:
     if duration <= window_sec:
         return 0.0
@@ -185,7 +227,6 @@ def best_motion_window_start(times: np.ndarray, motions: np.ndarray, duration: f
     start = max(0.0, best_start - PRE_ROLL_HIGHLIGHT)
     start = min(start, max(0.0, duration - window_sec))
     return start
-
 
 def pick_top_motion_peaks(times: np.ndarray, motions: np.ndarray, k: int, min_gap_sec: int, duration: float) -> List[float]:
     idx_sorted = np.argsort(-motions)
@@ -229,15 +270,18 @@ def build_metadata(kind: str, start_sec: float, duration_sec: int) -> dict:
         "duration_sec": int(duration_sec),
     }
 
-
 def write_metadata_files(out_dir: Path, rows: List[dict]):
     csv_path = out_dir / "youtube_metadata.csv"
     write_header = not csv_path.exists()
 
     with open(csv_path, "a", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=[
-            "file", "kind", "title", "description", "tags", "labels", "category", "privacy_suggestion", "start_sec", "duration_sec"
-        ])
+        w = csv.DictWriter(
+            f,
+            fieldnames=[
+                "file", "kind", "title", "description", "tags", "labels",
+                "category", "privacy_suggestion", "start_sec", "duration_sec"
+            ],
+        )
         if write_header:
             w.writeheader()
         for r in rows:
@@ -259,8 +303,11 @@ def write_metadata_files(out_dir: Path, rows: List[dict]):
     if json_path.exists():
         try:
             existing = json.loads(json_path.read_text(encoding="utf-8"))
-        except:
+            if not isinstance(existing, list):
+                existing = []
+        except Exception:
             existing = []
+
     existing.extend(rows)
     json_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
 
@@ -274,10 +321,20 @@ def output_highlight_path(video_path: Path) -> Path:
 def output_short_path(video_path: Path, idx: int) -> Path:
     return video_path.with_name(video_path.stem + SHORT_SUFFIX_FMT.format(idx))
 
+def is_our_output_file(p: Path) -> bool:
+    name = p.name
+    if name.endswith(HIGHLIGHT_SUFFIX):
+        return True
+    if "_SHORT_" in name and name.lower().endswith(".mp4"):
+        return True
+    return False
+
 def should_process(video_path: Path) -> bool:
     if video_path.suffix.lower() not in VIDEO_EXTS:
         return False
     if video_path.name.startswith("."):
+        return False
+    if is_our_output_file(video_path):
         return False
 
     highlight_exists = output_highlight_path(video_path).exists()
@@ -305,8 +362,13 @@ def process_video(video_path: Path):
         if not highlight_out.exists():
             start = best_motion_window_start(times, motions, duration, HIGHLIGHT_LEN_SEC)
             print(f"[HIGHLIGHT] Start @ {start:.2f}s -> {highlight_out.name}")
-            export_clip_reencode(str(video_path), str(highlight_out), start, min(HIGHLIGHT_LEN_SEC, duration), vertical=False)
-
+            export_clip_reencode(
+                str(video_path),
+                str(highlight_out),
+                start,
+                min(HIGHLIGHT_LEN_SEC, duration),
+                vertical=False
+            )
             meta_rows.append({
                 "file": highlight_out.name,
                 "kind": "highlight",
@@ -327,7 +389,13 @@ def process_video(video_path: Path):
             start = min(start, max(0.0, duration - SHORT_LEN_SEC))
             print(f"[SHORT {i}] Peak @ {peak_t:.2f}s, start @ {start:.2f}s -> {short_out.name}")
 
-            export_clip_reencode(str(video_path), str(short_out), start, min(SHORT_LEN_SEC, duration), vertical=MAKE_VERTICAL_SHORTS)
+            export_clip_reencode(
+                str(video_path),
+                str(short_out),
+                start,
+                min(SHORT_LEN_SEC, duration),
+                vertical=MAKE_VERTICAL_SHORTS
+            )
 
             meta_rows.append({
                 "file": short_out.name,
@@ -349,6 +417,9 @@ def process_video(video_path: Path):
 # Watcher
 # ====================
 class VideoHandler(FileSystemEventHandler):
+    """
+    Handle created/moved events. Many sync tools (Google Drive/OneDrive) use temp files then rename.
+    """
     def on_created(self, event):
         if event.is_directory:
             return
@@ -370,17 +441,24 @@ def initial_scan(folder: Path):
             process_video(p)
 
 def main():
-    folder = Path(WATCH_FOLDER)
+    # Verify required binaries first (clear errors on Windows when PATH isn't refreshed)
+    require_on_path("ffmpeg")
+    require_on_path("ffprobe")
+
+    folder = Path(WATCH_FOLDER).expanduser()
     folder.mkdir(parents=True, exist_ok=True)
+
+    print(f"[CONFIG] WATCH_FOLDER = {folder}")
+    print(f"[CONFIG] MAKE_VERTICAL_SHORTS = {MAKE_VERTICAL_SHORTS}")
 
     initial_scan(folder)
 
-    print(f"\n[WATCHING] {WATCH_FOLDER}")
+    print(f"\n[WATCHING] {folder}")
     print(f"Creates: {HIGHLIGHT_SUFFIX} + {SHORTS_TO_MAKE} shorts per video")
     print("Stop with Ctrl+C\n")
 
     observer = Observer()
-    observer.schedule(VideoHandler(), WATCH_FOLDER, recursive=False)
+    observer.schedule(VideoHandler(), str(folder), recursive=False)
     observer.start()
 
     try:

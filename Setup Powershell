@@ -1,0 +1,45 @@
+<# 
+setup_windows.ps1
+One-time setup for Windows:
+- Installs FFmpeg (ffmpeg + ffprobe) and Python via winget
+- Creates a local virtual environment (.venv)
+- Installs required Python packages
+
+Run in PowerShell as Administrator.
+#>
+
+$ErrorActionPreference = "Stop"
+
+function Assert-Command($name) {
+  if (-not (Get-Command $name -ErrorAction SilentlyContinue)) {
+    throw "Required command not found: $name"
+  }
+}
+
+Write-Host "`n=== Windows Setup: Madden Watcher ===`n"
+
+Write-Host "[1/5] Checking winget..."
+Assert-Command "winget"
+
+Write-Host "[2/5] Installing FFmpeg (includes ffprobe)..."
+winget install --id Gyan.FFmpeg -e --accept-package-agreements --accept-source-agreements
+
+Write-Host "[3/5] Installing Python 3.12..."
+winget install --id Python.Python.3.12 -e --accept-package-agreements --accept-source-agreements
+
+Write-Host "[4/5] Refreshing PATH in this PowerShell session..."
+$env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" +
+            [Environment]::GetEnvironmentVariable("Path","User")
+
+Write-Host "[5/5] Creating virtual environment + installing Python packages..."
+python -m venv .venv
+& .\.venv\Scripts\python.exe -m pip install --upgrade pip
+& .\.venv\Scripts\python.exe -m pip install opencv-python numpy watchdog
+
+Write-Host "`nDONE ✅"
+Write-Host "Next steps:"
+Write-Host "  1) (Optional) Set your watch folder for this session:"
+Write-Host '     $env:WATCH_FOLDER = "C:\Videos\madden26-agent"'
+Write-Host "  2) Run the script using the venv python:"
+Write-Host "     .\.venv\Scripts\python.exe .\your_script_name.py"
+Write-Host ""
